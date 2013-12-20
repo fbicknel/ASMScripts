@@ -1,6 +1,8 @@
 #!/usr/cisco/bin/perl
 
 use strict;
+use warnings;
+use Getopt::Long;
 
 {
     package lun;
@@ -169,8 +171,15 @@ sub parseSanlunOutput {
     \@luns;
 }
 
-my $primary = 1;
-my $re      = "^NASANC";
+my %opt;
+my @options = qw (dbname=s primary);
+die "Invalid options: $!\n" unless GetOptions (\%opt, @options);
+$opt{primary} = 1 unless defined $opt{primary};
+die "You must specify a dbname.\n" unless $opt{dbname};
+$opt{dbname} = uc ($opt{dbname});
+die "The dbname you used: $opt{dbname} is not a good name\n" unless $opt{dbname} =~ /^[A-Z]\w{0,6}\d?$/;
+print STDERR "Looking for LUNS belonging to $opt{dbname}\n";
+my $re      = "^$opt{dbname}";
 my $match   = qr/$re/;
 my $lunlist = parseSanlunOutput ();
 print "#!/bin/bash\n";
@@ -183,7 +192,7 @@ for my $lun (@$lunlist) {
 	# print "echo -e \"\tSense partition on disk:\"\n";
 	printf "sudo partprobe %s\n", $lun->multipathName;
 	# print "echo -e \"\tCreate ASM disk:\"\n";
-	if ($primary) {
+	if ($opt{primary}) {
         printf "sudo /etc/init.d/oracleasm createdisk %s %s\n", $lun->lunName, $lun->partitionName;
     } else {
         printf "sudo /usr/sbin/oracleasm scandisks %s\n", $lun->partitionName;
