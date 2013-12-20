@@ -1,0 +1,192 @@
+#!/usr/cisco/bin/perl
+
+use strict;
+
+{
+    package lun;
+    # Define a lun object
+    use Carp;
+    use strict;
+    use base qw(Class::Accessor);
+
+    our @allParms = qw/qtree vol filer lunName host mpath cloneOf id build/;
+
+    sub new {
+        my $type = shift;
+        $type = ref $type if ref $type;
+        my $this = {};
+        my $self = bless ($this, $type);
+        $self->mk_accessors ( @allParms );
+        my $parms = $self->_nparm (@_);
+        map { $self->$_ ($parms->{$_}) } keys %$parms;
+        $self;
+    }
+
+    sub _nparm {
+        my ($self, @parms) = @_;
+        my %parms;
+        if (ref $parms[0] eq 'HASH') {
+            %parms = %{$parms[0]};
+        } else {
+            %parms = @parms;
+        }
+        \%parms;
+    }
+
+    sub parseLunPath {
+        my ($self, $path) = @_;
+        my ($vol, $qtree, $lun) = $path =~ m^/vol/(\S+)/(\S+)/(\S+)^;
+        $self->lunName ($lun);
+        $self->qtree   ($qtree);
+        if (my ($id) = $qtree =~  m/([[:xdigit:]]{8}-(?:[[:xdigit:]]{4}-){3}[[:xdigit:]]{12})$/) {
+            $self->id ($id);
+        }
+        $self->vol     ($vol);
+    }
+
+    #
+    # just what it says: clone the lun whose object you used to call
+    # this method; returns the new lun object
+    # pass a hash or hashref of parameters to override certain parameters
+    # if you wish.  The clone will possess those parameters instead of
+    # the originals.
+    # e.g., $stumble = $mutter->clone (qtree => 'foobar');
+    # $stumble->qtree eq 'foobar'; # is true
+    #
+    sub clone {
+        my ($self, @parms) = @_;
+        my $parms = $self->_nparm (@parms);
+        my $clone = $self->new;
+        map { defined $self->$_ && $clone->$_ ($self->$_) } grep ! /build|mpath/, @allParms;
+        $clone->cloneOf ($self);    # remember our heritage
+        if ($parms->{'id'}) {
+            my ($qtree) = $clone->qtree =~ m/(.*?)(?:_[[:xdigit:]]{8}-(?:[[:xdigit:]]{4}-){3}[[:xdigit:]]{12})*$/;
+            $clone->qtree (sprintf ("%s_%s", $qtree, $parms->{'id'}));
+            $clone->id ($parms->{'id'});
+        }
+        for my $parm (@allParms) {
+            $clone->$parm ($parms->{$parm}) if $parms->{$parm};
+        }
+        return $clone;
+    }
+
+    #
+    # Given another lun object, copy it's parameters to myself
+    # you can override with @parms as above
+    #
+    sub copy {
+        my ($self, $lun, @parms) = @_;
+        return unless ref $lun eq 'lun';
+        my $parms = $self->_nparm (@parms);
+        map { defined $lun->$_ && $self->$_ ($lun->$_) } grep ! /build|mpath/, @allParms;
+        for my $parm (@allParms) {
+            $self->$parm ($parms->{$parm}) if $parms->{$parm};
+        }
+    }
+
+    #
+    # sort of the opposite of ->parseLunPath: build a lun path from the
+    # lun's parts
+    #
+    sub lunPath {
+        my ($lun) = @_;
+        return unless ref $lun eq 'lun' and $lun->vol and $lun->qtree and $lun->lunName;
+        return sprintf ("/vol/%s/%s/%s", $lun->vol,       $lun->qtree, $lun->lunName);
+    }
+
+    sub partitionName {
+        my ($lun) = @_;
+        return sprintf ("/dev/mapper/%sp1", $lun->mpath);
+    }
+
+    sub multipathName {
+        my ($lun) = @_;
+        return sprintf ("/dev/mapper/%s", $lun->mpath);
+    }
+
+    1;
+}
+
+sub parseSanlunOutput {
+    my $lun = new lun;                      # progenitor object to make it easy to generate new lun objects
+    chomp (my $host = `hostname`);
+    my @luns;
+    #
+    # This version knows how to parse sanlun 6.2
+    # We run sanlun and parse the results.  We're looking for all
+    # the LUNs available (we will pick the ones we want later) and
+    # the following information about each LUN:
+    # - its name
+    # - the filer where the lun lives
+    # - the os device name
+    #
+    # Because the output of sanlun -p is difficult to parse - they
+    # were nice enough to put ^$ blank lines between entries, but if
+    # it encounters a MP device with no ONTAP device it just crams
+    # that right in with no ^$ delimiter - we have to count instances
+    # of encountering an MP device in each entry.  If we encounter a
+    # second, we terminate the parse of that entry and prepare for a new
+    # one (i.e., wait for another ONTAP Path line).  The sd device paths
+    # happen after the MP device line, so we can't just terminate on
+    # the first one.  However, seeing a second MP line means we're done.
+    #
+    my $oneMPFound;                         # this will flag one (MP line) found
+    my ($thisLun, @flaws);
+    for (`/usr/sbin/sanlun lun show -p`) {
+        if (m/ONTAP Path: +(.*)/) {    # this begins an entry
+            my ($filer, $lunPath) = split ":", $1;
+            $thisLun = $lun->new;
+            $thisLun->parseLunPath ($lunPath);    # parse and store lun information
+            $thisLun->filer        ($filer);
+            $thisLun->host         ($host);
+            push @luns, $thisLun;
+        } elsif (m/Host Device: (.*)\(([\da-f]+)\)/) {    # found an MP line
+            next unless $thisLun;                         # Don't continue if we haven't started an entry yet
+            if ($oneMPFound) {                            # already found one and here's a second
+                # Time to shut down this entry; the rest is garbage
+                undef $oneMPFound;
+                undef $thisLun;                           # terminate the parse on this entry
+                next;
+            }
+            $oneMPFound = 1;                              # punch the ticket that we saw one MP line
+            my ($MPname, $wwn) = ($1, $2);                # we don't need wwn, but it's here if you do later
+            $thisLun->mpath ($MPname);
+        } elsif (m/^(up|down).*(sd\S+) /) {               # we found an sd path line
+            next unless $thisLun;                         # Don't continue if we haven't started an entry yet
+            my ($status, $sd) = ($1, $2);
+            if ($status eq 'down') {
+                push @flaws, sprintf ("%s path is down for %s", $sd, $thisLun->lunPath);
+            } elsif ($status eq 'up') {
+                # good - nothing to do, but good
+            } else {
+                push @flaws, sprintf ("Found a weird state for path %s: [%s]", $sd, $status);
+            }
+        } elsif (m/^$/) {
+            undef $thisLun;                               # ends a group
+            undef $oneMPFound;                            # lower the flag for MP line seen
+        }
+    }
+    \@luns;
+}
+
+my $primary = 1;
+my $re      = "^NASANC";
+my $match   = qr/$re/;
+my $lunlist = parseSanlunOutput ();
+print "#!/bin/bash\n";
+print "set -x\n";
+for my $lun (@$lunlist) {
+	next unless $lun->lunName =~ $match;
+	# printf "echo \"Working on %s\"\n", $lun->lunPath;
+	# print "echo -e \"\tCreate partition on disk:\"\n";
+	printf "echo 0 | sudo sfdisk %s\n", $lun->multipathName;
+	# print "echo -e \"\tSense partition on disk:\"\n";
+	printf "sudo partprobe %s\n", $lun->multipathName;
+	# print "echo -e \"\tCreate ASM disk:\"\n";
+	if ($primary) {
+        printf "sudo /etc/init.d/oracleasm createdisk %s %s\n", $lun->lunName, $lun->partitionName;
+    } else {
+        printf "sudo /usr/sbin/oracleasm scandisks %s\n", $lun->partitionName;
+    }
+}
+1;
